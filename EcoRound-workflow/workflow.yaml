@@ -17,7 +17,7 @@
 # ==========================================================================
 staging-settings:
   user-workflow:
-    workflow-name: "EroRound-workflow-staging"
+    workflow-name: "EcoRound-workflow-staging"
   workflow-artifacts:
     workflow-path: "."
     config-path: "./config.staging.json"
@@ -27,7 +27,7 @@ staging-settings:
 # ==========================================================================
 production-settings:
   user-workflow:
-    workflow-name: "EroRound-workflow-production"
+    workflow-name: "EcoRound-workflow-production"
   workflow-artifacts:
     workflow-path: "."
     config-path: "./config.production.json"
