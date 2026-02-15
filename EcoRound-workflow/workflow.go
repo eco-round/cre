@@ -1,39 +1,29 @@
+//go:build wasip1
+
 package main
 
 import (
-	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
-	"time"
-
-	"github.com/ethereum/go-ethereum/rpc"
-	"cre/contracts/evm/src/generated/balance_reader"
-	"cre/contracts/evm/src/generated/ierc20"
-	"cre/contracts/evm/src/generated/message_emitter"
-	"cre/contracts/evm/src/generated/reserve_manager"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/shopspring/decimal"
 
-	pbvalues "github.com/smartcontractkit/chainlink-protos/cre/go/values"
+	"cre/contracts/evm/src/generated/vault_match"
+
+	pb2 "github.com/smartcontractkit/chainlink-protos/cre/go/sdk"
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/blockchain/evm"
-	"github.com/smartcontractkit/cre-sdk-go/capabilities/blockchain/evm/bindings"
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/networking/http"
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/scheduler/cron"
 	"github.com/smartcontractkit/cre-sdk-go/cre"
 )
 
-// EVMConfig holds per-chain configuration.
+// ── Config ──────────────────────────────────────────────────────────────
+
 type EVMConfig struct {
-	TokenAddress          string `json:"tokenAddress"`
-	ReserveManagerAddress string `json:"reserveManagerAddress"`
-	BalanceReaderAddress  string `json:"balanceReaderAddress"`
-	MessageEmitterAddress string `json:"messageEmitterAddress"`
-	ChainName             string `json:"chainName"`
-	GasLimit              uint64 `json:"gasLimit"`
+	ChainName string `json:"chainName"`
+	GasLimit  uint64 `json:"gasLimit"`
 }
 
 func (e *EVMConfig) GetChainSelector() (uint64, error) {
@@ -45,33 +35,47 @@ func (e *EVMConfig) NewEVMClient() (*evm.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &evm.Client{
-		ChainSelector: chainSelector,
-	}, nil
+	return &evm.Client{ChainSelector: chainSelector}, nil
 }
 
 type Config struct {
-	Schedule string      `json:"schedule"`
-	URL      string      `json:"url"`
-	EVMs     []EVMConfig `json:"evms"`
+	Schedule       string      `json:"schedule"`
+	APIBaseUrl     string      `json:"apiBaseUrl"`
+	FactoryAddress string      `json:"factoryAddress"`
+	EVMs           []EVMConfig `json:"evms"`
 }
 
-type HTTPTriggerPayload struct {
-	ExecutionTime time.Time `json:"executionTime"`
+// ── API Response Types ──────────────────────────────────────────────────
+
+type APIMatch struct {
+	ID           uint       `json:"id"`
+	Status       string     `json:"status"`
+	VaultAddress string     `json:"vault_address"`
+	Result       *APIResult `json:"result,omitempty"`
 }
 
-type ReserveInfo struct {
-	LastUpdated  time.Time       `consensus_aggregation:"median" json:"lastUpdated"`
-	TotalReserve decimal.Decimal `consensus_aggregation:"median" json:"totalReserve"`
+type APIResult struct {
+	MatchStatus string `json:"match_status"`
+	Winner      string `json:"winner"`
 }
 
-type PORResponse struct {
-	AccountName string    `json:"accountName"`
-	TotalTrust  float64   `json:"totalTrust"`
-	TotalToken  float64   `json:"totalToken"`
-	Ripcord     bool      `json:"ripcord"`
-	UpdatedAt   time.Time `json:"updatedAt"`
+// Wrapper types with consensus tags for CRE SDK
+type MatchesResponse struct {
+	Matches []APIMatch `consensus_aggregation:"identical" json:"matches"`
 }
+
+type SourceResult struct {
+	Source      string `json:"source"`
+	MatchStatus string `json:"match_status"`
+	Winner      string `json:"winner"`
+	Confident   bool   `json:"confident"`
+}
+
+type SourcesResponse struct {
+	Sources []SourceResult `consensus_aggregation:"identical" json:"sources"`
+}
+
+// ── Workflow Setup ──────────────────────────────────────────────────────
 
 func InitWorkflow(config *Config, logger *slog.Logger, secretsProvider cre.SecretsProvider) (cre.Workflow[*Config], error) {
 	cronTriggerCfg := &cron.Config{
@@ -81,252 +85,297 @@ func InitWorkflow(config *Config, logger *slog.Logger, secretsProvider cre.Secre
 	workflow := cre.Workflow[*Config]{
 		cre.Handler(
 			cron.Trigger(cronTriggerCfg),
-			onPORCronTrigger,
+			onCronTrigger,
 		),
-	}
-
-	for _, evmCfg := range config.EVMs {
-		msgEmitter, err := prepareMessageEmitter(logger, evmCfg)
-		if err != nil {
-			return nil, fmt.Errorf("failed to prepare message emitter: %w", err)
-		}
-		chainSelector, err := evmCfg.GetChainSelector()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get chain selector: %w", err)
-		}
-		trigger, err := msgEmitter.LogTriggerMessageEmittedLog(chainSelector, evm.ConfidenceLevel_CONFIDENCE_LEVEL_LATEST, []message_emitter.MessageEmittedTopics{})
-		if err != nil {
-			return nil, fmt.Errorf("failed to create message emitted trigger: %w", err)
-		}
-		workflow = append(workflow, cre.Handler(trigger, onLogTrigger))
 	}
 
 	return workflow, nil
 }
 
-func onPORCronTrigger(config *Config, runtime cre.Runtime, outputs *cron.Payload) (string, error) {
-	return doPOR(config, runtime)
-}
+// ── Cron Handler ────────────────────────────────────────────────────────
 
-func onLogTrigger(config *Config, runtime cre.Runtime, payload *bindings.DecodedLog[message_emitter.MessageEmittedDecoded]) (string, error) {
+func onCronTrigger(config *Config, runtime cre.Runtime, outputs *cron.Payload) (string, error) {
 	logger := runtime.Logger()
+	logger.Info("EcoRound oracle tick", "apiBaseUrl", config.APIBaseUrl)
 
-	// use the decoded event log to get the event message
-	message := payload.Data.Message
-	logger.Info("Message retrieved from the event log", "message", message)
-
-	// the event message can also be retrieved from the contract itself
-	// below is an example of how to read from the contract
-	messageEmitter, err := prepareMessageEmitter(logger, config.EVMs[0])
-	if err != nil {
-		return "", fmt.Errorf("failed to prepare message emitter: %w", err)
-	}
-
-	// use the decoded event log to get the emitter address
-	// the emitter address is not a dynamic type, so it can be decoded from log even though its indexed
-	emitter := payload.Data.Emitter
-	lastMessageInput := message_emitter.GetLastMessageInput{
-		Emitter: common.Address(emitter),
-	}
-
-	blockNumber := pbvalues.ProtoToBigInt(payload.Log.BlockNumber)
-	logger.Info("Block number of event log", "blockNumber", blockNumber)
-	message, err = messageEmitter.GetLastMessage(runtime, lastMessageInput, blockNumber).Await()
-	if err != nil {
-		logger.Error("Could not read from contract", "contract_chain", config.EVMs[0].ChainName, "err", err.Error())
-		return "", err
-	}
-	logger.Info("Message retrieved from the contract", "message", message)
-
-	return message, nil
-}
-
-func doPOR(config *Config, runtime cre.Runtime) (string, error) {
-	logger := runtime.Logger()
-	// Fetch PoR
-	logger.Info("fetching por", "url", config.URL, "evms", config.EVMs)
+	// Step 1: Fetch all matches from admin API
 	client := &http.Client{}
-	reserveInfo, err := http.SendRequest(config, runtime, client, fetchPOR, cre.ConsensusAggregationFromTags[*ReserveInfo]()).Await()
+	matchesResp, err := http.SendRequest(config, runtime, client, fetchMatches, cre.ConsensusAggregationFromTags[*MatchesResponse]()).Await()
 	if err != nil {
-		logger.Error("error fetching por", "err", err)
-		return "", err
+		logger.Error("failed to fetch matches", "err", err)
+		return "", fmt.Errorf("failed to fetch matches: %w", err)
 	}
+	matches := matchesResp.Matches
 
-	logger.Info("ReserveInfo", "reserveInfo", reserveInfo)
+	logger.Info("fetched matches", "count", len(matches))
 
-	totalSupply, err := getTotalSupply(config, runtime)
+	evmClient, err := config.EVMs[0].NewEVMClient()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create EVM client: %w", err)
 	}
 
-	logger.Info("TotalSupply", "totalSupply", totalSupply)
-	totalReserveScaled := reserveInfo.TotalReserve.Mul(decimal.NewFromUint64(1e18)).BigInt()
-	logger.Info("TotalReserveScaled", "totalReserveScaled", totalReserveScaled)
+	results := make([]string, 0)
 
-	nativeTokenBalance, err := fetchNativeTokenBalance(runtime, config.EVMs[0], config.EVMs[0].TokenAddress)
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch native token balance: %w", err)
-	}
-	logger.Info("Native token balance", "token", config.EVMs[0].TokenAddress, "balance", nativeTokenBalance)
+	// Process matches in REVERSE order (Oldest first)
+	// This ensures we finish earlier games before newer ones, and avoids getting stuck
+	// on a new "waiting" match while an older "ready" match sits in queue.
+	for i := len(matches) - 1; i >= 0; i-- {
+		m := matches[i]
 
-	// Update reserves
-	if err := updateReserves(config, runtime, totalSupply, totalReserveScaled); err != nil {
-		return "", fmt.Errorf("failed to update reserves: %w", err)
-	}
-
-	return reserveInfo.TotalReserve.String(), nil
-}
-
-func prepareMessageEmitter(logger *slog.Logger, evmCfg EVMConfig) (*message_emitter.MessageEmitter, error) {
-	evmClient, err := evmCfg.NewEVMClient()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create EVM client for %s: %w", evmCfg.ChainName, err)
-	}
-
-	address := common.HexToAddress(evmCfg.MessageEmitterAddress)
-
-	messageEmitter, err := message_emitter.NewMessageEmitter(evmClient, address, nil)
-	if err != nil {
-		logger.Error("failed to create message emitter", "address", evmCfg.MessageEmitterAddress, "err", err)
-		return nil, fmt.Errorf("failed to create message emitter for address %s: %w", evmCfg.MessageEmitterAddress, err)
-	}
-
-	return messageEmitter, nil
-}
-
-func fetchNativeTokenBalance(runtime cre.Runtime, evmCfg EVMConfig, tokenHolderAddress string) (*big.Int, error) {
-	logger := runtime.Logger()
-	evmClient, err := evmCfg.NewEVMClient()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create EVM client for %s: %w", evmCfg.ChainName, err)
-	}
-
-	balanceReaderAddress := common.HexToAddress(evmCfg.BalanceReaderAddress)
-	balanceReader, err := balance_reader.NewBalanceReader(evmClient, balanceReaderAddress, nil)
-	if err != nil {
-		logger.Error("failed to create balance reader", "address", evmCfg.BalanceReaderAddress, "err", err)
-		return nil, fmt.Errorf("failed to create balance reader for address %s: %w", evmCfg.BalanceReaderAddress, err)
-	}
-	tokenAddress, err := hexToBytes(tokenHolderAddress)
-	if err != nil {
-		logger.Error("failed to decode token address", "address", tokenHolderAddress, "err", err)
-		return nil, fmt.Errorf("failed to decode token address %s: %w", tokenHolderAddress, err)
-	}
-
-	logger.Info("Getting native balances", "address", evmCfg.BalanceReaderAddress, "tokenAddress", tokenHolderAddress)
-	balances, err := balanceReader.GetNativeBalances(runtime, balance_reader.GetNativeBalancesInput{
-		Addresses: []common.Address{common.Address(tokenAddress)},
-	}, big.NewInt(rpc.FinalizedBlockNumber.Int64())).Await()
-
-	if err != nil {
-		logger.Error("Could not read from contract", "contract_chain", evmCfg.ChainName, "err", err.Error())
-		return nil, err
-	}
-
-	if len(balances) < 1 {
-		logger.Error("No balances returned from contract", "contract_chain", evmCfg.ChainName)
-		return nil, fmt.Errorf("no balances returned from contract for chain %s", evmCfg.ChainName)
-	}
-
-	return balances[0], nil
-}
-
-func getTotalSupply(config *Config, runtime cre.Runtime) (*big.Int, error) {
-	evms := config.EVMs
-	logger := runtime.Logger()
-	// Fetch supply from all EVMs in parallel
-	supplyPromises := make([]cre.Promise[*big.Int], len(evms))
-	for i, evmCfg := range evms {
-		evmClient, err := evmCfg.NewEVMClient()
-		if err != nil {
-			logger.Error("failed to create EVM client", "chainName", evmCfg.ChainName, "err", err)
-			return nil, fmt.Errorf("failed to create EVM client for %s: %w", evmCfg.ChainName, err)
+		if m.Status != "open" && m.Status != "locked" {
+			continue // skip finished/cancelled
+		}
+		if m.VaultAddress == "" {
+			continue // no vault deployed yet
 		}
 
-		address := common.HexToAddress(evmCfg.TokenAddress)
-		token, err := ierc20.NewIERC20(evmClient, address, nil)
+		logger.Info("checking match", "id", m.ID, "status", m.Status, "vault", m.VaultAddress)
+
+		// Fetch aggregated results from all 3 sources
+		sourcesResp, err := http.SendRequest(config, runtime, client, fetchSourceResults(m.ID), cre.ConsensusAggregationFromTags[*SourcesResponse]()).Await()
 		if err != nil {
-			logger.Error("failed to create token", "address", evmCfg.TokenAddress, "err", err)
-			return nil, fmt.Errorf("failed to create token for address %s: %w", evmCfg.TokenAddress, err)
+			logger.Error("failed to fetch source results", "matchId", m.ID, "err", err)
+			continue
 		}
-		evmTotalSupplyPromise := token.TotalSupply(runtime, big.NewInt(rpc.FinalizedBlockNumber.Int64()))
-		supplyPromises[i] = evmTotalSupplyPromise
+		sourceResults := sourcesResp.Sources
+
+		// Check consensus
+		action := checkConsensus(m.Status, sourceResults, logger)
+
+		if action == "lock" {
+			logger.Info("consensus reached: LOCK match", "matchId", m.ID)
+			result, err := lockMatchOnChain(runtime, evmClient, m.VaultAddress)
+			if err != nil {
+				logger.Error("failed to lock match on-chain", "matchId", m.ID, "err", err)
+			} else {
+				logger.Info("match locked on-chain", "matchId", m.ID, "txHash", result)
+				results = append(results, fmt.Sprintf("locked:%d", m.ID))
+			}
+		} else if action == "resolve" {
+			winner := getConsensusWinner(sourceResults)
+			logger.Info("consensus reached: RESOLVE match", "matchId", m.ID, "winner", winner)
+			result, err := resolveMatchOnChain(runtime, evmClient, m.VaultAddress, winner)
+			if err != nil {
+				logger.Error("failed to resolve match on-chain", "matchId", m.ID, "err", err)
+			} else {
+				logger.Info("match resolved on-chain", "matchId", m.ID, "winner", winner, "txHash", result)
+				results = append(results, fmt.Sprintf("resolved:%d:winner=%d", m.ID, winner))
+			}
+		} else {
+			logger.Info("no consensus yet", "matchId", m.ID, "action", action)
+		}
+
+		// LIMIT: Stop after processing 1 match to stay under 5 HTTP calls
+		break 
 	}
 
-	// We can add cre.AwaitAll that takes []cre.Promise[T] and returns ([]T, error)
-	totalSupply := big.NewInt(0)
-	for i, promise := range supplyPromises {
-		supply, err := promise.Await()
-		if err != nil {
-			chainName := evms[i].ChainName
-			logger.Error("Could not read from contract", "contract_chain", chainName, "err", err.Error())
-			return nil, err
-		}
-
-		totalSupply = totalSupply.Add(totalSupply, supply)
-	}
-
-	return totalSupply, nil
+	summary := fmt.Sprintf("processed %d matches, actions: %v", len(matches), results)
+	logger.Info(summary)
+	return summary, nil
 }
 
-func updateReserves(config *Config, runtime cre.Runtime, totalSupply *big.Int, totalReserveScaled *big.Int) error {
-	evmCfg := config.EVMs[0]
-	logger := runtime.Logger()
-	logger.Info("Updating reserves", "totalSupply", totalSupply, "totalReserveScaled", totalReserveScaled)
+// ── HTTP Fetchers ───────────────────────────────────────────────────────
 
-	evmClient, err := evmCfg.NewEVMClient()
-	if err != nil {
-		return fmt.Errorf("failed to create EVM client for %s: %w", evmCfg.ChainName, err)
-	}
-
-	reserveManager, err := reserve_manager.NewReserveManager(evmClient, common.HexToAddress(evmCfg.ReserveManagerAddress), nil)
-	if err != nil {
-		return fmt.Errorf("failed to create reserve manager: %w", err)
-	}
-
-	logger.Info("Writing report", "totalSupply", totalSupply, "totalReserveScaled", totalReserveScaled)
-	resp, err := reserveManager.WriteReportFromUpdateReserves(runtime, reserve_manager.UpdateReserves{
-		TotalMinted:  totalSupply,
-		TotalReserve: totalReserveScaled,
-	}, nil).Await()
-
-	if err != nil {
-		logger.Error("WriteReport await failed", "error", err, "errorType", fmt.Sprintf("%T", err))
-		return fmt.Errorf("failed to write report: %w", err)
-	}
-	logger.Info("Write report succeeded", "response", resp)
-	logger.Info("Write report transaction succeeded at", "txHash", common.BytesToHash(resp.TxHash).Hex())
-	return nil
-}
-
-func fetchPOR(config *Config, logger *slog.Logger, sendRequester *http.SendRequester) (*ReserveInfo, error) {
-	httpActionOut, err := sendRequester.SendRequest(&http.Request{
+func fetchMatches(config *Config, logger *slog.Logger, sendRequester *http.SendRequester) (*MatchesResponse, error) {
+	url := config.APIBaseUrl + "/admin/matches"
+	resp, err := sendRequester.SendRequest(&http.Request{
 		Method: "GET",
-		Url:    config.URL,
+		Url:    url,
 	}).Await()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("GET %s failed: %w", url, err)
 	}
 
-	porResp := &PORResponse{}
-	if err = json.Unmarshal(httpActionOut.Body, porResp); err != nil {
-		return nil, err
+	var response MatchesResponse
+	if err := json.Unmarshal(resp.Body, &response); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal matches: %w", err)
 	}
-
-	if porResp.Ripcord {
-		return nil, errors.New("ripcord is true")
-	}
-
-	res := &ReserveInfo{
-		LastUpdated:  porResp.UpdatedAt.UTC(),
-		TotalReserve: decimal.NewFromFloat(porResp.TotalToken),
-	}
-	return res, nil
+	return &response, nil
 }
 
-func hexToBytes(hexStr string) ([]byte, error) {
-	if len(hexStr) < 2 || hexStr[:2] != "0x" {
-		return nil, fmt.Errorf("invalid hex string: %s", hexStr)
+func fetchSourceResults(matchID uint) func(config *Config, logger *slog.Logger, sendRequester *http.SendRequester) (*SourcesResponse, error) {
+	return func(config *Config, logger *slog.Logger, sendRequester *http.SendRequester) (*SourcesResponse, error) {
+		sources := []string{"pandascore", "vlr", "liquipedia"}
+		results := make([]SourceResult, 0, len(sources))
+
+		for _, source := range sources {
+			url := fmt.Sprintf("%s/%s/matches/%d", config.APIBaseUrl, source, matchID)
+
+			resp, err := sendRequester.SendRequest(&http.Request{
+				Method: "GET",
+				Url:    url,
+			}).Await()
+			if err != nil {
+				logger.Error("failed to fetch from source", "source", source, "err", err)
+				continue
+			}
+
+			var match APIMatch
+			if err := json.Unmarshal(resp.Body, &match); err != nil {
+				logger.Error("failed to unmarshal source response", "source", source, "err", err)
+				continue
+			}
+
+			sr := SourceResult{
+				Source:    source,
+				Confident: true,
+			}
+			if match.Result != nil {
+				sr.MatchStatus = match.Result.MatchStatus
+				sr.Winner = match.Result.Winner
+			}
+			results = append(results, sr)
+		}
+
+		return &SourcesResponse{Sources: results}, nil
 	}
-	return hex.DecodeString(hexStr[2:])
 }
+
+// ── Consensus Logic ─────────────────────────────────────────────────────
+
+func checkConsensus(currentStatus string, sources []SourceResult, logger *slog.Logger) string {
+	if len(sources) < 2 {
+		return "wait" // need at least 2 sources
+	}
+
+	if currentStatus == "open" {
+		// Check if 2/3 sources report "started"
+		startedCount := 0
+		for _, s := range sources {
+			if s.MatchStatus == "started" || s.MatchStatus == "ended" {
+				startedCount++
+			}
+		}
+		if startedCount >= 2 {
+			logger.Info("consensus: 2+ sources report started", "count", startedCount)
+			return "lock"
+		}
+	}
+
+	if currentStatus == "locked" {
+		// Check if 2/3 sources report "ended" and agree on winner
+		endedCount := 0
+		winnerVotes := map[string]int{}
+		for _, s := range sources {
+			if s.MatchStatus == "ended" && s.Winner != "" {
+				endedCount++
+				winnerVotes[s.Winner]++
+			}
+		}
+		if endedCount >= 2 {
+			// Check winner consensus
+			for winner, votes := range winnerVotes {
+				if votes >= 2 {
+					logger.Info("consensus: 2+ sources agree on winner", "winner", winner, "votes", votes)
+					return "resolve"
+				}
+			}
+		}
+	}
+
+	return "wait"
+}
+
+func getConsensusWinner(sources []SourceResult) uint8 {
+	// Count votes for each winner
+	votes := map[string]int{}
+	for _, s := range sources {
+		if s.MatchStatus == "ended" && s.Winner != "" {
+			votes[s.Winner]++
+		}
+	}
+
+	// Find winner with most votes
+	bestWinner := ""
+	bestVotes := 0
+	for winner, count := range votes {
+		if count > bestVotes {
+			bestWinner = winner
+			bestVotes = count
+		}
+	}
+
+	// Map team name to uint8 (1 = TeamA, 2 = TeamB)
+	// The winner string from the API is the team tag/name
+	// We return 1 for first team, 2 for second team
+	// The actual mapping will depend on the match data
+	if bestWinner == "teamA" || bestWinner == "1" {
+		return 1
+	}
+	return 2 // default to team B if not explicitly team A
+}
+
+// ── On-Chain Actions ────────────────────────────────────────────────────
+
+func lockMatchOnChain(runtime cre.Runtime, evmClient *evm.Client, vaultAddr string) (string, error) {
+	codec, err := vault_match.NewCodec()
+	if err != nil {
+		return "", fmt.Errorf("failed to create codec: %w", err)
+	}
+
+	calldata, err := codec.EncodeLockMatchMethodCall()
+	if err != nil {
+		return "", fmt.Errorf("failed to encode lockMatch: %w", err)
+	}
+
+	addr := common.HexToAddress(vaultAddr)
+	report, err := runtime.GenerateReport(&pb2.ReportRequest{
+		EncodedPayload: calldata,
+		EncoderName:    "evm",
+		SigningAlgo:    "ecdsa",
+		HashingAlgo:    "keccak256",
+	}).Await()
+	if err != nil {
+		return "", fmt.Errorf("failed to generate report: %w", err)
+	}
+
+	resp, err := evmClient.WriteReport(runtime, &evm.WriteCreReportRequest{
+		Receiver:  addr.Bytes(),
+		Report:    report,
+		GasConfig: nil,
+	}).Await()
+	if err != nil {
+		return "", fmt.Errorf("lockMatch tx failed: %w", err)
+	}
+
+	return common.BytesToHash(resp.TxHash).Hex(), nil
+}
+
+func resolveMatchOnChain(runtime cre.Runtime, evmClient *evm.Client, vaultAddr string, winner uint8) (string, error) {
+	codec, err := vault_match.NewCodec()
+	if err != nil {
+		return "", fmt.Errorf("failed to create codec: %w", err)
+	}
+
+	calldata, err := codec.EncodeResolveMatchMethodCall(vault_match.ResolveMatchInput{
+		Winner: winner,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to encode resolveMatch: %w", err)
+	}
+
+	addr := common.HexToAddress(vaultAddr)
+	report, err := runtime.GenerateReport(&pb2.ReportRequest{
+		EncodedPayload: calldata,
+		EncoderName:    "evm",
+		SigningAlgo:    "ecdsa",
+		HashingAlgo:    "keccak256",
+	}).Await()
+	if err != nil {
+		return "", fmt.Errorf("failed to generate report: %w", err)
+	}
+
+	resp, err := evmClient.WriteReport(runtime, &evm.WriteCreReportRequest{
+		Receiver:  addr.Bytes(),
+		Report:    report,
+		GasConfig: nil,
+	}).Await()
+	if err != nil {
+		return "", fmt.Errorf("resolveMatch tx failed: %w", err)
+	}
+
+	return common.BytesToHash(resp.TxHash).Hex(), nil
+}
+
+// unused but kept for potential future use
+var _ = big.NewInt

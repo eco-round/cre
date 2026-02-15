@@ -26,11 +26,14 @@
 # ==========================================================================
 staging-settings:
   rpcs:
-    - chain-name: ethereum-testnet-sepolia
+    - chain-name: ethereum-mainnet-base-1
+      chain-selector: 84531
       url: https://virtual.rpc.tenderly.co/EndPx/project/private/ecoround-base/f8772423-6da7-4e96-a5ed-f46c09c05bf6
 
 # ==========================================================================
 production-settings:
   rpcs:
-    - chain-name: ethereum-testnet-sepolia
+    - chain-name: ethereum-mainnet-base-1
+      chain-selector: 84531
       url: https://virtual.rpc.tenderly.co/EndPx/project/private/ecoround-base/f8772423-6da7-4e96-a5ed-f46c09c05bf6
+
