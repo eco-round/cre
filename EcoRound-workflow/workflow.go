@@ -96,80 +96,106 @@ func InitWorkflow(config *Config, logger *slog.Logger, secretsProvider cre.Secre
 
 func onCronTrigger(config *Config, runtime cre.Runtime, outputs *cron.Payload) (string, error) {
 	logger := runtime.Logger()
-	logger.Info("EcoRound oracle tick", "apiBaseUrl", config.APIBaseUrl)
+	logger.Info("[ORACLE] Tick started", "api", config.APIBaseUrl)
 
 	// Step 1: Fetch all matches from admin API
 	client := &http.Client{}
 	matchesResp, err := http.SendRequest(config, runtime, client, fetchMatches, cre.ConsensusAggregationFromTags[*MatchesResponse]()).Await()
 	if err != nil {
-		logger.Error("failed to fetch matches", "err", err)
+		logger.Error("[ORACLE] Failed to fetch matches from API", "err", err)
 		return "", fmt.Errorf("failed to fetch matches: %w", err)
 	}
 	matches := matchesResp.Matches
 
-	logger.Info("fetched matches", "count", len(matches))
+	// Count by status for summary
+	openCount, lockedCount, skippedCount := 0, 0, 0
+	for _, m := range matches {
+		switch m.Status {
+		case "open":
+			openCount++
+		case "locked":
+			lockedCount++
+		default:
+			skippedCount++
+		}
+	}
+	logger.Info(fmt.Sprintf("[FETCH] Found %d matches (%d open, %d locked, %d skipped)", len(matches), openCount, lockedCount, skippedCount))
 
 	evmClient, err := config.EVMs[0].NewEVMClient()
 	if err != nil {
 		return "", fmt.Errorf("failed to create EVM client: %w", err)
 	}
 
-	results := make([]string, 0)
+	var actions []string
 
-	// Process matches in REVERSE order (Oldest first)
-	// This ensures we finish earlier games before newer ones, and avoids getting stuck
-	// on a new "waiting" match while an older "ready" match sits in queue.
+	// Process matches in REVERSE order (oldest first)
 	for i := len(matches) - 1; i >= 0; i-- {
 		m := matches[i]
 
 		if m.Status != "open" && m.Status != "locked" {
-			continue // skip finished/cancelled
+			continue
 		}
 		if m.VaultAddress == "" {
-			continue // no vault deployed yet
+			continue
 		}
 
-		logger.Info("checking match", "id", m.ID, "status", m.Status, "vault", m.VaultAddress)
+		vaultShort := m.VaultAddress[:6] + ".." + m.VaultAddress[len(m.VaultAddress)-4:]
+		logger.Info(fmt.Sprintf("[CHECK] Match #%d | %s | vault=%s", m.ID, upper(m.Status), vaultShort))
 
 		// Fetch aggregated results from all 3 sources
 		sourcesResp, err := http.SendRequest(config, runtime, client, fetchSourceResults(m.ID), cre.ConsensusAggregationFromTags[*SourcesResponse]()).Await()
 		if err != nil {
-			logger.Error("failed to fetch source results", "matchId", m.ID, "err", err)
+			logger.Error(fmt.Sprintf("[CHECK] Match #%d — failed to fetch sources", m.ID), "err", err)
 			continue
 		}
 		sourceResults := sourcesResp.Sources
+
+		// Log individual source statuses
+		logSourceSummary(logger, m.ID, sourceResults)
 
 		// Check consensus
 		action := checkConsensus(m.Status, sourceResults, logger)
 
 		if action == "lock" {
-			logger.Info("consensus reached: LOCK match", "matchId", m.ID)
+			startedCount := countByStatus(sourceResults, "started")
+			logger.Info(fmt.Sprintf("[ACTION] LOCK Match #%d — consensus: %d/3 sources report started", m.ID, startedCount))
 			result, err := lockMatchOnChain(runtime, evmClient, m.VaultAddress)
 			if err != nil {
-				logger.Error("failed to lock match on-chain", "matchId", m.ID, "err", err)
+				logger.Error(fmt.Sprintf("[TX] Match #%d lock FAILED", m.ID), "err", err)
 			} else {
-				logger.Info("match locked on-chain", "matchId", m.ID, "txHash", result)
-				results = append(results, fmt.Sprintf("locked:%d", m.ID))
+				txShort := result[:10] + ".." + result[len(result)-8:]
+				logger.Info(fmt.Sprintf("[TX] Match #%d locked on-chain | tx=%s", m.ID, txShort))
+				actions = append(actions, fmt.Sprintf("locked:#%d", m.ID))
 			}
 		} else if action == "resolve" {
 			winner := getConsensusWinner(sourceResults)
-			logger.Info("consensus reached: RESOLVE match", "matchId", m.ID, "winner", winner)
+			winnerLabel := "TeamA"
+			if winner == 2 {
+				winnerLabel = "TeamB"
+			}
+			endedCount := countByStatus(sourceResults, "ended")
+			consensusWinnerName := getConsensusWinnerName(sourceResults)
+			logger.Info(fmt.Sprintf("[ACTION] RESOLVE Match #%d — consensus: %d/3 sources agree winner=%s (%s)", m.ID, endedCount, consensusWinnerName, winnerLabel))
 			result, err := resolveMatchOnChain(runtime, evmClient, m.VaultAddress, winner)
 			if err != nil {
-				logger.Error("failed to resolve match on-chain", "matchId", m.ID, "err", err)
+				logger.Error(fmt.Sprintf("[TX] Match #%d resolve FAILED", m.ID), "err", err)
 			} else {
-				logger.Info("match resolved on-chain", "matchId", m.ID, "winner", winner, "txHash", result)
-				results = append(results, fmt.Sprintf("resolved:%d:winner=%d", m.ID, winner))
+				txShort := result[:10] + ".." + result[len(result)-8:]
+				logger.Info(fmt.Sprintf("[TX] Match #%d resolved on-chain | winner=%s | tx=%s", m.ID, consensusWinnerName, txShort))
+				actions = append(actions, fmt.Sprintf("resolved:#%d→%s", m.ID, consensusWinnerName))
 			}
 		} else {
-			logger.Info("no consensus yet", "matchId", m.ID, "action", action)
+			logger.Info(fmt.Sprintf("[CHECK] Match #%d — no consensus yet, waiting", m.ID))
 		}
 
 		// LIMIT: Stop after processing 1 match to stay under 5 HTTP calls
-		break 
+		break
 	}
 
-	summary := fmt.Sprintf("processed %d matches, actions: %v", len(matches), results)
+	summary := fmt.Sprintf("[DONE] Processed %d matches → %v", len(matches), actions)
+	if len(actions) == 0 {
+		summary = fmt.Sprintf("[DONE] Processed %d matches → no actions taken", len(matches))
+	}
 	logger.Info(summary)
 	return summary, nil
 }
@@ -233,6 +259,78 @@ func fetchSourceResults(matchID uint) func(config *Config, logger *slog.Logger, 
 
 // ── Consensus Logic ─────────────────────────────────────────────────────
 
+// ── Log Helpers ──────────────────────────────────────────────────────────
+
+func upper(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+	result := ""
+	for _, c := range s {
+		if c >= 'a' && c <= 'z' {
+			result += string(c - 32)
+		} else {
+			result += string(c)
+		}
+	}
+	return result
+}
+
+func logSourceSummary(logger *slog.Logger, matchID uint, sources []SourceResult) {
+	parts := make([]string, 0, len(sources))
+	for _, s := range sources {
+		status := s.MatchStatus
+		if status == "" {
+			status = "pending"
+		}
+		entry := s.Source + "=" + status
+		if s.Winner != "" {
+			entry += "(" + s.Winner + ")"
+		}
+		parts = append(parts, entry)
+	}
+	missing := 3 - len(sources)
+	for i := 0; i < missing; i++ {
+		parts = append(parts, "?=no-response")
+	}
+	summary := ""
+	for i, p := range parts {
+		if i > 0 {
+			summary += ", "
+		}
+		summary += p
+	}
+	logger.Info(fmt.Sprintf("[CHECK] Match #%d sources: %s", matchID, summary))
+}
+
+func countByStatus(sources []SourceResult, status string) int {
+	count := 0
+	for _, s := range sources {
+		if s.MatchStatus == status {
+			count++
+		}
+	}
+	return count
+}
+
+func getConsensusWinnerName(sources []SourceResult) string {
+	votes := map[string]int{}
+	for _, s := range sources {
+		if s.MatchStatus == "ended" && s.Winner != "" {
+			votes[s.Winner]++
+		}
+	}
+	bestWinner := ""
+	bestVotes := 0
+	for winner, count := range votes {
+		if count > bestVotes {
+			bestWinner = winner
+			bestVotes = count
+		}
+	}
+	return bestWinner
+}
+
 func checkConsensus(currentStatus string, sources []SourceResult, logger *slog.Logger) string {
 	if len(sources) < 2 {
 		return "wait" // need at least 2 sources
@@ -247,7 +345,6 @@ func checkConsensus(currentStatus string, sources []SourceResult, logger *slog.L
 			}
 		}
 		if startedCount >= 2 {
-			logger.Info("consensus: 2+ sources report started", "count", startedCount)
 			return "lock"
 		}
 	}
@@ -266,7 +363,6 @@ func checkConsensus(currentStatus string, sources []SourceResult, logger *slog.L
 			// Check winner consensus
 			for winner, votes := range winnerVotes {
 				if votes >= 2 {
-					logger.Info("consensus: 2+ sources agree on winner", "winner", winner, "votes", votes)
 					return "resolve"
 				}
 			}
