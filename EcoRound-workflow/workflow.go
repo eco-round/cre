@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"math/big"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 
@@ -78,18 +78,27 @@ type SourcesResponse struct {
 // ── Workflow Setup ──────────────────────────────────────────────────────
 
 func InitWorkflow(config *Config, logger *slog.Logger, secretsProvider cre.SecretsProvider) (cre.Workflow[*Config], error) {
-	cronTriggerCfg := &cron.Config{
-		Schedule: config.Schedule,
-	}
-
 	workflow := cre.Workflow[*Config]{
 		cre.Handler(
-			cron.Trigger(cronTriggerCfg),
+			cron.Trigger(&cron.Config{Schedule: config.Schedule}),
 			onCronTrigger,
 		),
 	}
-
 	return workflow, nil
+}
+
+// ── Confidential HTTP — Secret Helper ───────────────────────────────────
+
+// getSecretValue fetches a secret from the Chainlink DON Vault via enclave-protected
+// runtime.GetSecret(). In simulation, secrets are resolved from the .env file.
+// Secrets are always fetched SEQUENTIALLY — never in parallel.
+func getSecretValue(runtime cre.Runtime, logger *slog.Logger, id string) string {
+	result, err := runtime.GetSecret(&pb2.SecretRequest{Id: id}).Await()
+	if err != nil || result == nil {
+		logger.Warn("[ORACLE] Could not fetch secret — proceeding without auth", "id", id, "err", err)
+		return ""
+	}
+	return result.Value
 }
 
 // ── Cron Handler ────────────────────────────────────────────────────────
@@ -97,6 +106,20 @@ func InitWorkflow(config *Config, logger *slog.Logger, secretsProvider cre.Secre
 func onCronTrigger(config *Config, runtime cre.Runtime, outputs *cron.Payload) (string, error) {
 	logger := runtime.Logger()
 	logger.Info("[ORACLE] Tick started", "api", config.APIBaseUrl)
+
+	// ── Confidential HTTP: fetch API keys sequentially from DON Vault ──────
+	// Keys are injected inside the CRE enclave — never visible to node operators.
+	// In local simulation, values are resolved from PANDASCORE_API_KEY etc. in .env
+	sourceKeys := map[string]string{
+		"pandascore": getSecretValue(runtime, logger, "PANDASCORE_API_KEY"),
+		"vlr":        getSecretValue(runtime, logger, "VLR_API_KEY"),
+		"liquipedia": getSecretValue(runtime, logger, "LIQUIPEDIA_API_KEY"),
+	}
+	logger.Info("[ORACLE] Confidential keys loaded",
+		"pandascore", sourceKeys["pandascore"] != "",
+		"vlr", sourceKeys["vlr"] != "",
+		"liquipedia", sourceKeys["liquipedia"] != "",
+	)
 
 	// Step 1: Fetch all matches from admin API
 	client := &http.Client{}
@@ -107,7 +130,6 @@ func onCronTrigger(config *Config, runtime cre.Runtime, outputs *cron.Payload) (
 	}
 	matches := matchesResp.Matches
 
-	// Count by status for summary
 	openCount, lockedCount, skippedCount := 0, 0, 0
 	for _, m := range matches {
 		switch m.Status {
@@ -128,7 +150,8 @@ func onCronTrigger(config *Config, runtime cre.Runtime, outputs *cron.Payload) (
 
 	var actions []string
 
-	// Process matches in REVERSE order (oldest first)
+	// Process matches in reverse order (oldest first).
+	// Limited to 1 match per tick to stay within CRE HTTP call budget.
 	for i := len(matches) - 1; i >= 0; i-- {
 		m := matches[i]
 
@@ -140,61 +163,54 @@ func onCronTrigger(config *Config, runtime cre.Runtime, outputs *cron.Payload) (
 		}
 
 		vaultShort := m.VaultAddress[:6] + ".." + m.VaultAddress[len(m.VaultAddress)-4:]
-		logger.Info(fmt.Sprintf("[CHECK] Match #%d | %s | vault=%s", m.ID, upper(m.Status), vaultShort))
+		logger.Info(fmt.Sprintf("[CHECK] Match #%d | %s | vault=%s", m.ID, strings.ToUpper(m.Status), vaultShort))
 
-		// Fetch aggregated results from all 3 sources
-		sourcesResp, err := http.SendRequest(config, runtime, client, fetchSourceResults(m.ID), cre.ConsensusAggregationFromTags[*SourcesResponse]()).Await()
+		sourcesResp, err := http.SendRequest(config, runtime, client, fetchSourceResults(m.ID, sourceKeys), cre.ConsensusAggregationFromTags[*SourcesResponse]()).Await()
 		if err != nil {
 			logger.Error(fmt.Sprintf("[CHECK] Match #%d — failed to fetch sources", m.ID), "err", err)
 			continue
 		}
-		sourceResults := sourcesResp.Sources
 
-		// Log individual source statuses
-		logSourceSummary(logger, m.ID, sourceResults)
+		logSourceSummary(logger, m.ID, sourcesResp.Sources)
 
-		// Check consensus
-		action := checkConsensus(m.Status, sourceResults, logger)
-
-		if action == "lock" {
-			startedCount := countByStatus(sourceResults, "started")
+		switch checkConsensus(m.Status, sourcesResp.Sources) {
+		case "lock":
+			startedCount := countByStatus(sourcesResp.Sources, "started")
 			logger.Info(fmt.Sprintf("[ACTION] LOCK Match #%d — consensus: %d/3 sources report started", m.ID, startedCount))
-			result, err := lockMatchOnChain(runtime, evmClient, m.VaultAddress)
+			txHash, err := lockMatchOnChain(runtime, evmClient, m.VaultAddress)
 			if err != nil {
 				logger.Error(fmt.Sprintf("[TX] Match #%d lock FAILED", m.ID), "err", err)
 			} else {
-				txShort := result[:10] + ".." + result[len(result)-8:]
-				logger.Info(fmt.Sprintf("[TX] Match #%d locked on-chain | tx=%s", m.ID, txShort))
+				logger.Info(fmt.Sprintf("[TX] Match #%d locked | tx=%s", m.ID, shortHash(txHash)))
 				actions = append(actions, fmt.Sprintf("locked:#%d", m.ID))
 			}
-		} else if action == "resolve" {
-			winner := getConsensusWinner(sourceResults)
+
+		case "resolve":
+			winnerUint, winnerName := consensusWinner(sourcesResp.Sources)
 			winnerLabel := "TeamA"
-			if winner == 2 {
+			if winnerUint == 2 {
 				winnerLabel = "TeamB"
 			}
-			endedCount := countByStatus(sourceResults, "ended")
-			consensusWinnerName := getConsensusWinnerName(sourceResults)
-			logger.Info(fmt.Sprintf("[ACTION] RESOLVE Match #%d — consensus: %d/3 sources agree winner=%s (%s)", m.ID, endedCount, consensusWinnerName, winnerLabel))
-			result, err := resolveMatchOnChain(runtime, evmClient, m.VaultAddress, winner)
+			endedCount := countByStatus(sourcesResp.Sources, "ended")
+			logger.Info(fmt.Sprintf("[ACTION] RESOLVE Match #%d — consensus: %d/3 agree winner=%s (%s)", m.ID, endedCount, winnerName, winnerLabel))
+			txHash, err := resolveMatchOnChain(runtime, evmClient, m.VaultAddress, winnerUint)
 			if err != nil {
 				logger.Error(fmt.Sprintf("[TX] Match #%d resolve FAILED", m.ID), "err", err)
 			} else {
-				txShort := result[:10] + ".." + result[len(result)-8:]
-				logger.Info(fmt.Sprintf("[TX] Match #%d resolved on-chain | winner=%s | tx=%s", m.ID, consensusWinnerName, txShort))
-				actions = append(actions, fmt.Sprintf("resolved:#%d→%s", m.ID, consensusWinnerName))
+				logger.Info(fmt.Sprintf("[TX] Match #%d resolved | winner=%s | tx=%s", m.ID, winnerName, shortHash(txHash)))
+				actions = append(actions, fmt.Sprintf("resolved:#%d→%s", m.ID, winnerName))
 			}
-		} else {
+
+		default:
 			logger.Info(fmt.Sprintf("[CHECK] Match #%d — no consensus yet, waiting", m.ID))
 		}
 
-		// LIMIT: Stop after processing 1 match to stay under 5 HTTP calls
-		break
+		break // one match per tick (CRE HTTP budget)
 	}
 
-	summary := fmt.Sprintf("[DONE] Processed %d matches → %v", len(matches), actions)
-	if len(actions) == 0 {
-		summary = fmt.Sprintf("[DONE] Processed %d matches → no actions taken", len(matches))
+	summary := fmt.Sprintf("[DONE] Processed %d matches → no actions taken", len(matches))
+	if len(actions) > 0 {
+		summary = fmt.Sprintf("[DONE] Processed %d matches → %v", len(matches), actions)
 	}
 	logger.Info(summary)
 	return summary, nil
@@ -204,22 +220,21 @@ func onCronTrigger(config *Config, runtime cre.Runtime, outputs *cron.Payload) (
 
 func fetchMatches(config *Config, logger *slog.Logger, sendRequester *http.SendRequester) (*MatchesResponse, error) {
 	url := config.APIBaseUrl + "/admin/matches"
-	resp, err := sendRequester.SendRequest(&http.Request{
-		Method: "GET",
-		Url:    url,
-	}).Await()
+	resp, err := sendRequester.SendRequest(&http.Request{Method: "GET", Url: url}).Await()
 	if err != nil {
 		return nil, fmt.Errorf("GET %s failed: %w", url, err)
 	}
-
 	var response MatchesResponse
 	if err := json.Unmarshal(resp.Body, &response); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal matches: %w", err)
+		return nil, fmt.Errorf("unmarshal matches: %w", err)
 	}
 	return &response, nil
 }
 
-func fetchSourceResults(matchID uint) func(config *Config, logger *slog.Logger, sendRequester *http.SendRequester) (*SourcesResponse, error) {
+// fetchSourceResults returns a fetcher that queries all 3 data sources for a match.
+// API keys are injected via Chainlink Confidential HTTP — resolved inside the CRE
+// enclave from the DON Vault, never visible to node operators or logs.
+func fetchSourceResults(matchID uint, sourceKeys map[string]string) func(*Config, *slog.Logger, *http.SendRequester) (*SourcesResponse, error) {
 	return func(config *Config, logger *slog.Logger, sendRequester *http.SendRequester) (*SourcesResponse, error) {
 		sources := []string{"pandascore", "vlr", "liquipedia"}
 		results := make([]SourceResult, 0, len(sources))
@@ -227,12 +242,22 @@ func fetchSourceResults(matchID uint) func(config *Config, logger *slog.Logger, 
 		for _, source := range sources {
 			url := fmt.Sprintf("%s/%s/matches/%d", config.APIBaseUrl, source, matchID)
 
+			headers := map[string]string{}
+			if key := sourceKeys[source]; key != "" {
+				headers["X-Api-Key"] = key
+			}
+
 			resp, err := sendRequester.SendRequest(&http.Request{
-				Method: "GET",
-				Url:    url,
+				Method:  "GET",
+				Url:     url,
+				Headers: headers,
 			}).Await()
 			if err != nil {
 				logger.Error("failed to fetch from source", "source", source, "err", err)
+				continue
+			}
+			if resp.StatusCode == 401 {
+				logger.Warn(fmt.Sprintf("[CHECK] Source %s rejected API key (401) — skipping", source))
 				continue
 			}
 
@@ -242,10 +267,7 @@ func fetchSourceResults(matchID uint) func(config *Config, logger *slog.Logger, 
 				continue
 			}
 
-			sr := SourceResult{
-				Source:    source,
-				Confident: true,
-			}
+			sr := SourceResult{Source: source, Confident: true}
 			if match.Result != nil {
 				sr.MatchStatus = match.Result.MatchStatus
 				sr.Winner = match.Result.Winner
@@ -257,50 +279,57 @@ func fetchSourceResults(matchID uint) func(config *Config, logger *slog.Logger, 
 	}
 }
 
-// ── Consensus Logic ─────────────────────────────────────────────────────
+// ── Consensus Logic ──────────────────────────────────────────────────────
 
-// ── Log Helpers ──────────────────────────────────────────────────────────
-
-func upper(s string) string {
-	if len(s) == 0 {
-		return s
+func checkConsensus(currentStatus string, sources []SourceResult) string {
+	if len(sources) < 2 {
+		return "wait"
 	}
-	result := ""
-	for _, c := range s {
-		if c >= 'a' && c <= 'z' {
-			result += string(c - 32)
-		} else {
-			result += string(c)
+	switch currentStatus {
+	case "open":
+		count := 0
+		for _, s := range sources {
+			if s.MatchStatus == "started" || s.MatchStatus == "ended" {
+				count++
+			}
+		}
+		if count >= 2 {
+			return "lock"
+		}
+	case "locked":
+		endedVotes := map[string]int{}
+		for _, s := range sources {
+			if s.MatchStatus == "ended" && s.Winner != "" {
+				endedVotes[s.Winner]++
+			}
+		}
+		for _, votes := range endedVotes {
+			if votes >= 2 {
+				return "resolve"
+			}
 		}
 	}
-	return result
+	return "wait"
 }
 
-func logSourceSummary(logger *slog.Logger, matchID uint, sources []SourceResult) {
-	parts := make([]string, 0, len(sources))
+// consensusWinner returns the winner's uint8 enum value and display name.
+func consensusWinner(sources []SourceResult) (uint8, string) {
+	votes := map[string]int{}
 	for _, s := range sources {
-		status := s.MatchStatus
-		if status == "" {
-			status = "pending"
+		if s.MatchStatus == "ended" && s.Winner != "" {
+			votes[s.Winner]++
 		}
-		entry := s.Source + "=" + status
-		if s.Winner != "" {
-			entry += "(" + s.Winner + ")"
+	}
+	best, bestVotes := "", 0
+	for winner, count := range votes {
+		if count > bestVotes {
+			best, bestVotes = winner, count
 		}
-		parts = append(parts, entry)
 	}
-	missing := 3 - len(sources)
-	for i := 0; i < missing; i++ {
-		parts = append(parts, "?=no-response")
+	if best == "teamA" || best == "1" {
+		return 1, best
 	}
-	summary := ""
-	for i, p := range parts {
-		if i > 0 {
-			summary += ", "
-		}
-		summary += p
-	}
-	logger.Info(fmt.Sprintf("[CHECK] Match #%d sources: %s", matchID, summary))
+	return 2, best
 }
 
 func countByStatus(sources []SourceResult, status string) int {
@@ -313,165 +342,80 @@ func countByStatus(sources []SourceResult, status string) int {
 	return count
 }
 
-func getConsensusWinnerName(sources []SourceResult) string {
-	votes := map[string]int{}
+// ── Log Helpers ──────────────────────────────────────────────────────────
+
+func logSourceSummary(logger *slog.Logger, matchID uint, sources []SourceResult) {
+	parts := make([]string, 0, 3)
 	for _, s := range sources {
-		if s.MatchStatus == "ended" && s.Winner != "" {
-			votes[s.Winner]++
+		status := s.MatchStatus
+		if status == "" {
+			status = "pending"
 		}
-	}
-	bestWinner := ""
-	bestVotes := 0
-	for winner, count := range votes {
-		if count > bestVotes {
-			bestWinner = winner
-			bestVotes = count
+		entry := s.Source + "=" + status
+		if s.Winner != "" {
+			entry += "(" + s.Winner + ")"
 		}
+		parts = append(parts, entry)
 	}
-	return bestWinner
+	for len(parts) < 3 {
+		parts = append(parts, "?=no-response")
+	}
+	logger.Info(fmt.Sprintf("[CHECK] Match #%d sources: %s", matchID, strings.Join(parts, ", ")))
 }
 
-func checkConsensus(currentStatus string, sources []SourceResult, logger *slog.Logger) string {
-	if len(sources) < 2 {
-		return "wait" // need at least 2 sources
+func shortHash(hash string) string {
+	if len(hash) < 14 {
+		return hash
 	}
-
-	if currentStatus == "open" {
-		// Check if 2/3 sources report "started"
-		startedCount := 0
-		for _, s := range sources {
-			if s.MatchStatus == "started" || s.MatchStatus == "ended" {
-				startedCount++
-			}
-		}
-		if startedCount >= 2 {
-			return "lock"
-		}
-	}
-
-	if currentStatus == "locked" {
-		// Check if 2/3 sources report "ended" and agree on winner
-		endedCount := 0
-		winnerVotes := map[string]int{}
-		for _, s := range sources {
-			if s.MatchStatus == "ended" && s.Winner != "" {
-				endedCount++
-				winnerVotes[s.Winner]++
-			}
-		}
-		if endedCount >= 2 {
-			// Check winner consensus
-			for winner, votes := range winnerVotes {
-				if votes >= 2 {
-					return "resolve"
-				}
-			}
-		}
-	}
-
-	return "wait"
+	return hash[:10] + ".." + hash[len(hash)-8:]
 }
 
-func getConsensusWinner(sources []SourceResult) uint8 {
-	// Count votes for each winner
-	votes := map[string]int{}
-	for _, s := range sources {
-		if s.MatchStatus == "ended" && s.Winner != "" {
-			votes[s.Winner]++
-		}
-	}
-
-	// Find winner with most votes
-	bestWinner := ""
-	bestVotes := 0
-	for winner, count := range votes {
-		if count > bestVotes {
-			bestWinner = winner
-			bestVotes = count
-		}
-	}
-
-	// Map team name to uint8 (1 = TeamA, 2 = TeamB)
-	// The winner string from the API is the team tag/name
-	// We return 1 for first team, 2 for second team
-	// The actual mapping will depend on the match data
-	if bestWinner == "teamA" || bestWinner == "1" {
-		return 1
-	}
-	return 2 // default to team B if not explicitly team A
-}
-
-// ── On-Chain Actions ────────────────────────────────────────────────────
+// ── On-Chain Writes ──────────────────────────────────────────────────────
 
 func lockMatchOnChain(runtime cre.Runtime, evmClient *evm.Client, vaultAddr string) (string, error) {
 	codec, err := vault_match.NewCodec()
 	if err != nil {
-		return "", fmt.Errorf("failed to create codec: %w", err)
+		return "", fmt.Errorf("new codec: %w", err)
 	}
-
 	calldata, err := codec.EncodeLockMatchMethodCall()
 	if err != nil {
-		return "", fmt.Errorf("failed to encode lockMatch: %w", err)
+		return "", fmt.Errorf("encode lockMatch: %w", err)
 	}
-
-	addr := common.HexToAddress(vaultAddr)
-	report, err := runtime.GenerateReport(&pb2.ReportRequest{
-		EncodedPayload: calldata,
-		EncoderName:    "evm",
-		SigningAlgo:    "ecdsa",
-		HashingAlgo:    "keccak256",
-	}).Await()
-	if err != nil {
-		return "", fmt.Errorf("failed to generate report: %w", err)
-	}
-
-	resp, err := evmClient.WriteReport(runtime, &evm.WriteCreReportRequest{
-		Receiver:  addr.Bytes(),
-		Report:    report,
-		GasConfig: nil,
-	}).Await()
-	if err != nil {
-		return "", fmt.Errorf("lockMatch tx failed: %w", err)
-	}
-
-	return common.BytesToHash(resp.TxHash).Hex(), nil
+	return writeOnChain(runtime, evmClient, vaultAddr, calldata)
 }
 
 func resolveMatchOnChain(runtime cre.Runtime, evmClient *evm.Client, vaultAddr string, winner uint8) (string, error) {
 	codec, err := vault_match.NewCodec()
 	if err != nil {
-		return "", fmt.Errorf("failed to create codec: %w", err)
+		return "", fmt.Errorf("new codec: %w", err)
 	}
-
-	calldata, err := codec.EncodeResolveMatchMethodCall(vault_match.ResolveMatchInput{
-		Winner: winner,
-	})
+	calldata, err := codec.EncodeResolveMatchMethodCall(vault_match.ResolveMatchInput{Winner: winner})
 	if err != nil {
-		return "", fmt.Errorf("failed to encode resolveMatch: %w", err)
+		return "", fmt.Errorf("encode resolveMatch: %w", err)
 	}
+	return writeOnChain(runtime, evmClient, vaultAddr, calldata)
+}
 
-	addr := common.HexToAddress(vaultAddr)
+// writeOnChain generates a CRE report and submits it as an EVM transaction.
+func writeOnChain(runtime cre.Runtime, evmClient *evm.Client, vaultAddr string, calldata []byte) (string, error) {
 	report, err := runtime.GenerateReport(&pb2.ReportRequest{
 		EncodedPayload: calldata,
 		EncoderName:    "evm",
 		SigningAlgo:    "ecdsa",
 		HashingAlgo:    "keccak256",
-	}).Await()
+	}).Await() 
 	if err != nil {
-		return "", fmt.Errorf("failed to generate report: %w", err)
+		return "", fmt.Errorf("generate report: %w", err)
 	}
 
 	resp, err := evmClient.WriteReport(runtime, &evm.WriteCreReportRequest{
-		Receiver:  addr.Bytes(),
+		Receiver:  common.HexToAddress(vaultAddr).Bytes(),
 		Report:    report,
 		GasConfig: nil,
 	}).Await()
 	if err != nil {
-		return "", fmt.Errorf("resolveMatch tx failed: %w", err)
+		return "", fmt.Errorf("write report: %w", err)
 	}
 
 	return common.BytesToHash(resp.TxHash).Hex(), nil
 }
-
-// unused but kept for potential future use
-var _ = big.NewInt

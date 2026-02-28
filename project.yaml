@@ -28,12 +28,12 @@ staging-settings:
   rpcs:
     - chain-name: ethereum-mainnet-base-1
       chain-selector: 84531
-      url: https://virtual.rpc.tenderly.co/EndPx/project/private/ecoround-base/f8772423-6da7-4e96-a5ed-f46c09c05bf6
+      url: https://virtual.rpc.tenderly.co/ecoround/ecoround/private/ecoround/9cf903bc-95b4-4882-bf0d-1625e4dca2b5
 
 # ==========================================================================
 production-settings:
   rpcs:
     - chain-name: ethereum-mainnet-base-1
       chain-selector: 84531
-      url: https://virtual.rpc.tenderly.co/EndPx/project/private/ecoround-base/f8772423-6da7-4e96-a5ed-f46c09c05bf6
+      url: https://virtual.rpc.tenderly.co/ecoround/ecoround/private/ecoround/9cf903bc-95b4-4882-bf0d-1625e4dca2b5
 
