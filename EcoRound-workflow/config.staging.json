@@ -1,7 +1,7 @@
 {
   "schedule": "*/30 * * * * *",
   "apiBaseUrl": "http://localhost:8080/api/v1",
-  "factoryAddress": "0x602473fc59ff5eefbe5d6c86d3af5c64ac7987bc",
+  "factoryAddress": "0x6038d1fdaa71b793ba01fa57e0e8e854597e52d7",
   "evms": [
     {
       "chainName": "ethereum-mainnet-base-1",

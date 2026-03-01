@@ -22,25 +22,30 @@ var (
 
 // VaultMatchMock is a mock implementation of VaultMatch for testing.
 type VaultMatchMock struct {
-	MATCHID             func() (*big.Int, error)
-	MORPHOVAULT         func() (common.Address, error)
-	USDC                func() (common.Address, error)
-	GetExpectedPayout   func(GetExpectedPayoutInput) (*big.Int, error)
-	GetTotalDeposits    func() (*big.Int, error)
-	GetUserTotalDeposit func(GetUserTotalDepositInput) (*big.Int, error)
-	GetYieldBalance     func() (*big.Int, error)
-	HasClaimed          func(HasClaimedInput) (bool, error)
-	Oracle              func() (common.Address, error)
-	Owner               func() (common.Address, error)
-	Paused              func() (bool, error)
-	Status              func() (uint8, error)
-	TeamAName           func() (string, error)
-	TeamBName           func() (string, error)
-	TotalTeamA          func() (*big.Int, error)
-	TotalTeamB          func() (*big.Int, error)
-	TotalYield          func() (*big.Int, error)
-	UserDeposits        func(UserDepositsInput) (*big.Int, error)
-	Winner              func() (uint8, error)
+	MATCHID                 func() (*big.Int, error)
+	MORPHOVAULT             func() (common.Address, error)
+	USDC                    func() (common.Address, error)
+	GetExpectedAuthor       func() (common.Address, error)
+	GetExpectedPayout       func(GetExpectedPayoutInput) (*big.Int, error)
+	GetExpectedWorkflowId   func() ([32]byte, error)
+	GetExpectedWorkflowName func() ([10]byte, error)
+	GetForwarderAddress     func() (common.Address, error)
+	GetTotalDeposits        func() (*big.Int, error)
+	GetUserTotalDeposit     func(GetUserTotalDepositInput) (*big.Int, error)
+	GetYieldBalance         func() (*big.Int, error)
+	HasClaimed              func(HasClaimedInput) (bool, error)
+	Oracle                  func() (common.Address, error)
+	Owner                   func() (common.Address, error)
+	Paused                  func() (bool, error)
+	Status                  func() (uint8, error)
+	SupportsInterface       func(SupportsInterfaceInput) (bool, error)
+	TeamAName               func() (string, error)
+	TeamBName               func() (string, error)
+	TotalTeamA              func() (*big.Int, error)
+	TotalTeamB              func() (*big.Int, error)
+	TotalYield              func() (*big.Int, error)
+	UserDeposits            func(UserDepositsInput) (*big.Int, error)
+	Winner                  func() (uint8, error)
 }
 
 // NewVaultMatchMock creates a new VaultMatchMock for testing.
@@ -86,6 +91,16 @@ func NewVaultMatchMock(address common.Address, clientMock *evmmock.ClientCapabil
 			}
 			return abi.Methods["USDC"].Outputs.Pack(result)
 		},
+		string(abi.Methods["getExpectedAuthor"].ID[:4]): func(payload []byte) ([]byte, error) {
+			if mock.GetExpectedAuthor == nil {
+				return nil, errors.New("getExpectedAuthor method not mocked")
+			}
+			result, err := mock.GetExpectedAuthor()
+			if err != nil {
+				return nil, err
+			}
+			return abi.Methods["getExpectedAuthor"].Outputs.Pack(result)
+		},
 		string(abi.Methods["getExpectedPayout"].ID[:4]): func(payload []byte) ([]byte, error) {
 			if mock.GetExpectedPayout == nil {
 				return nil, errors.New("getExpectedPayout method not mocked")
@@ -109,6 +124,36 @@ func NewVaultMatchMock(address common.Address, clientMock *evmmock.ClientCapabil
 				return nil, err
 			}
 			return abi.Methods["getExpectedPayout"].Outputs.Pack(result)
+		},
+		string(abi.Methods["getExpectedWorkflowId"].ID[:4]): func(payload []byte) ([]byte, error) {
+			if mock.GetExpectedWorkflowId == nil {
+				return nil, errors.New("getExpectedWorkflowId method not mocked")
+			}
+			result, err := mock.GetExpectedWorkflowId()
+			if err != nil {
+				return nil, err
+			}
+			return abi.Methods["getExpectedWorkflowId"].Outputs.Pack(result)
+		},
+		string(abi.Methods["getExpectedWorkflowName"].ID[:4]): func(payload []byte) ([]byte, error) {
+			if mock.GetExpectedWorkflowName == nil {
+				return nil, errors.New("getExpectedWorkflowName method not mocked")
+			}
+			result, err := mock.GetExpectedWorkflowName()
+			if err != nil {
+				return nil, err
+			}
+			return abi.Methods["getExpectedWorkflowName"].Outputs.Pack(result)
+		},
+		string(abi.Methods["getForwarderAddress"].ID[:4]): func(payload []byte) ([]byte, error) {
+			if mock.GetForwarderAddress == nil {
+				return nil, errors.New("getForwarderAddress method not mocked")
+			}
+			result, err := mock.GetForwarderAddress()
+			if err != nil {
+				return nil, err
+			}
+			return abi.Methods["getForwarderAddress"].Outputs.Pack(result)
 		},
 		string(abi.Methods["getTotalDeposits"].ID[:4]): func(payload []byte) ([]byte, error) {
 			if mock.GetTotalDeposits == nil {
@@ -217,6 +262,30 @@ func NewVaultMatchMock(address common.Address, clientMock *evmmock.ClientCapabil
 				return nil, err
 			}
 			return abi.Methods["status"].Outputs.Pack(result)
+		},
+		string(abi.Methods["supportsInterface"].ID[:4]): func(payload []byte) ([]byte, error) {
+			if mock.SupportsInterface == nil {
+				return nil, errors.New("supportsInterface method not mocked")
+			}
+			inputs := abi.Methods["supportsInterface"].Inputs
+
+			values, err := inputs.Unpack(payload)
+			if err != nil {
+				return nil, errors.New("Failed to unpack payload")
+			}
+			if len(values) != 1 {
+				return nil, errors.New("expected 1 input value")
+			}
+
+			args := SupportsInterfaceInput{
+				InterfaceId: values[0].([4]byte),
+			}
+
+			result, err := mock.SupportsInterface(args)
+			if err != nil {
+				return nil, err
+			}
+			return abi.Methods["supportsInterface"].Outputs.Pack(result)
 		},
 		string(abi.Methods["teamAName"].ID[:4]): func(payload []byte) ([]byte, error) {
 			if mock.TeamAName == nil {
