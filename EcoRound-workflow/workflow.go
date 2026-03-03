@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -155,15 +156,39 @@ func onCronTrigger(config *Config, runtime cre.Runtime, outputs *cron.Payload) (
 	for i := len(matches) - 1; i >= 0; i-- {
 		m := matches[i]
 
-		if m.Status != "open" && m.Status != "locked" {
-			continue
-		}
 		if m.VaultAddress == "" {
 			continue
 		}
 
+		// ── On-chain status read (EVM call, not HTTP — doesn't count toward budget) ──
+		// This is the source of truth. API status may lag after CRE-initiated TXs.
+		vaultBinding, err := vault_match.NewVaultMatch(evmClient, common.HexToAddress(m.VaultAddress), nil)
+		if err != nil {
+			logger.Error(fmt.Sprintf("[CHECK] Match #%d — failed to create vault binding", m.ID), "err", err)
+			continue
+		}
+		onChainStatus, err := vaultBinding.Status(runtime, big.NewInt(-2)).Await()
+		if err != nil {
+			logger.Error(fmt.Sprintf("[CHECK] Match #%d — failed to read on-chain status", m.ID), "err", err)
+			continue
+		}
+
+		// uint8: 0=Open, 1=Locked, 2=Resolved
+		var statusStr string
+		switch onChainStatus {
+		case 0:
+			statusStr = "open"
+		case 1:
+			statusStr = "locked"
+		case 2:
+			logger.Info(fmt.Sprintf("[SKIP] Match #%d already resolved on-chain", m.ID))
+			continue
+		default:
+			continue
+		}
+
 		vaultShort := m.VaultAddress[:6] + ".." + m.VaultAddress[len(m.VaultAddress)-4:]
-		logger.Info(fmt.Sprintf("[CHECK] Match #%d | %s | vault=%s", m.ID, strings.ToUpper(m.Status), vaultShort))
+		logger.Info(fmt.Sprintf("[CHECK] Match #%d | ONCHAIN=%s | vault=%s", m.ID, strings.ToUpper(statusStr), vaultShort))
 
 		sourcesResp, err := http.SendRequest(config, runtime, client, fetchSourceResults(m.ID, sourceKeys), cre.ConsensusAggregationFromTags[*SourcesResponse]()).Await()
 		if err != nil {
@@ -173,7 +198,7 @@ func onCronTrigger(config *Config, runtime cre.Runtime, outputs *cron.Payload) (
 
 		logSourceSummary(logger, m.ID, sourcesResp.Sources)
 
-		switch checkConsensus(m.Status, sourcesResp.Sources) {
+		switch checkConsensus(statusStr, sourcesResp.Sources) {
 		case "lock":
 			startedCount := countByStatus(sourcesResp.Sources, "started")
 			logger.Info(fmt.Sprintf("[ACTION] LOCK Match #%d — consensus: %d/3 sources report started", m.ID, startedCount))
@@ -403,7 +428,7 @@ func writeOnChain(runtime cre.Runtime, evmClient *evm.Client, vaultAddr string, 
 		EncoderName:    "evm",
 		SigningAlgo:    "ecdsa",
 		HashingAlgo:    "keccak256",
-	}).Await() 
+	}).Await()
 	if err != nil {
 		return "", fmt.Errorf("generate report: %w", err)
 	}
