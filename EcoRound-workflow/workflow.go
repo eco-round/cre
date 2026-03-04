@@ -160,7 +160,7 @@ func onCronTrigger(config *Config, runtime cre.Runtime, outputs *cron.Payload) (
 			continue
 		}
 
-		// ── On-chain status read (EVM call, not HTTP — doesn't count toward budget) ──
+		// ── On-chain status read (EVM callwai) ──
 		// This is the source of truth. API status may lag after CRE-initiated TXs.
 		vaultBinding, err := vault_match.NewVaultMatch(evmClient, common.HexToAddress(m.VaultAddress), nil)
 		if err != nil {
@@ -351,7 +351,7 @@ func consensusWinner(sources []SourceResult) (uint8, string) {
 			best, bestVotes = winner, count
 		}
 	}
-	if best == "teamA" || best == "1" {
+	if strings.EqualFold(best, "teamA") || best == "1" {
 		return 1, best
 	}
 	return 2, best
