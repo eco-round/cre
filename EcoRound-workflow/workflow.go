@@ -15,6 +15,7 @@ import (
 
 	pb2 "github.com/smartcontractkit/chainlink-protos/cre/go/sdk"
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/blockchain/evm"
+	"github.com/smartcontractkit/cre-sdk-go/capabilities/networking/confidentialhttp"
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/networking/http"
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/scheduler/cron"
 	"github.com/smartcontractkit/cre-sdk-go/cre"
@@ -88,39 +89,11 @@ func InitWorkflow(config *Config, logger *slog.Logger, secretsProvider cre.Secre
 	return workflow, nil
 }
 
-// ── Confidential HTTP — Secret Helper ───────────────────────────────────
-
-// getSecretValue fetches a secret from the Chainlink DON Vault via enclave-protected
-// runtime.GetSecret(). In simulation, secrets are resolved from the .env file.
-// Secrets are always fetched SEQUENTIALLY — never in parallel.
-func getSecretValue(runtime cre.Runtime, logger *slog.Logger, id string) string {
-	result, err := runtime.GetSecret(&pb2.SecretRequest{Id: id}).Await()
-	if err != nil || result == nil {
-		logger.Warn("[ORACLE] Could not fetch secret — proceeding without auth", "id", id, "err", err)
-		return ""
-	}
-	return result.Value
-}
-
 // ── Cron Handler ────────────────────────────────────────────────────────
 
 func onCronTrigger(config *Config, runtime cre.Runtime, outputs *cron.Payload) (string, error) {
 	logger := runtime.Logger()
 	logger.Info("[ORACLE] Tick started", "api", config.APIBaseUrl)
-
-	// ── Confidential HTTP: fetch API keys sequentially from DON Vault ──────
-	// Keys are injected inside the CRE enclave — never visible to node operators.
-	// In local simulation, values are resolved from PANDASCORE_API_KEY etc. in .env
-	sourceKeys := map[string]string{
-		"pandascore": getSecretValue(runtime, logger, "PANDASCORE_API_KEY"),
-		"vlr":        getSecretValue(runtime, logger, "VLR_API_KEY"),
-		"liquipedia": getSecretValue(runtime, logger, "LIQUIPEDIA_API_KEY"),
-	}
-	logger.Info("[ORACLE] Confidential keys loaded",
-		"pandascore", sourceKeys["pandascore"] != "",
-		"vlr", sourceKeys["vlr"] != "",
-		"liquipedia", sourceKeys["liquipedia"] != "",
-	)
 
 	// Step 1: Fetch all matches from admin API
 	client := &http.Client{}
@@ -190,7 +163,7 @@ func onCronTrigger(config *Config, runtime cre.Runtime, outputs *cron.Payload) (
 		vaultShort := m.VaultAddress[:6] + ".." + m.VaultAddress[len(m.VaultAddress)-4:]
 		logger.Info(fmt.Sprintf("[CHECK] Match #%d | ONCHAIN=%s | vault=%s", m.ID, strings.ToUpper(statusStr), vaultShort))
 
-		sourcesResp, err := http.SendRequest(config, runtime, client, fetchSourceResults(m.ID, sourceKeys), cre.ConsensusAggregationFromTags[*SourcesResponse]()).Await()
+		sourcesResp, err := fetchSourceResultsConfidential(config, runtime, logger, m.ID)
 		if err != nil {
 			logger.Error(fmt.Sprintf("[CHECK] Match #%d — failed to fetch sources", m.ID), "err", err)
 			continue
@@ -256,52 +229,64 @@ func fetchMatches(config *Config, logger *slog.Logger, sendRequester *http.SendR
 	return &response, nil
 }
 
-// fetchSourceResults returns a fetcher that queries all 3 data sources for a match.
-// API keys are injected via Chainlink Confidential HTTP — resolved inside the CRE
-// enclave from the DON Vault, never visible to node operators or logs.
-func fetchSourceResults(matchID uint, sourceKeys map[string]string) func(*Config, *slog.Logger, *http.SendRequester) (*SourcesResponse, error) {
-	return func(config *Config, logger *slog.Logger, sendRequester *http.SendRequester) (*SourcesResponse, error) {
-		sources := []string{"pandascore", "vlr", "liquipedia"}
-		results := make([]SourceResult, 0, len(sources))
+// fetchSourceResultsConfidential queries all 3 data sources for a match using
+// Chainlink Confidential HTTP. API keys are injected via {{.KEY}} template syntax
+// inside a TEE enclave — secrets are resolved from the Chainlink DON Vault and
+// never visible to node operators, logs, or source code.
+func fetchSourceResultsConfidential(config *Config, runtime cre.Runtime, logger *slog.Logger, matchID uint) (*SourcesResponse, error) {
+	type sourceInfo struct {
+		name  string
+		keyID string
+	}
+	sources := []sourceInfo{
+		{name: "pandascore", keyID: "PANDASCORE_API_KEY"},
+		{name: "vlr", keyID: "VLR_API_KEY"},
+		{name: "liquipedia", keyID: "LIQUIPEDIA_API_KEY"},
+	}
 
-		for _, source := range sources {
-			url := fmt.Sprintf("%s/%s/matches/%d", config.APIBaseUrl, source, matchID)
+	results := make([]SourceResult, 0, len(sources))
+	client := confidentialhttp.Client{}
 
-			headers := map[string]string{}
-			if key := sourceKeys[source]; key != "" {
-				headers["X-Api-Key"] = key
-			}
+	for _, src := range sources {
+		url := fmt.Sprintf("%s/%s/matches/%d", config.APIBaseUrl, src.name, matchID)
 
-			resp, err := sendRequester.SendRequest(&http.Request{
-				Method:  "GET",
-				Url:     url,
-				Headers: headers,
-			}).Await()
-			if err != nil {
-				logger.Error("failed to fetch from source", "source", source, "err", err)
-				continue
-			}
-			if resp.StatusCode == 401 {
-				logger.Warn(fmt.Sprintf("[CHECK] Source %s rejected API key (401) — skipping", source))
-				continue
-			}
-
-			var match APIMatch
-			if err := json.Unmarshal(resp.Body, &match); err != nil {
-				logger.Error("failed to unmarshal source response", "source", source, "err", err)
-				continue
-			}
-
-			sr := SourceResult{Source: source, Confident: true}
-			if match.Result != nil {
-				sr.MatchStatus = match.Result.MatchStatus
-				sr.Winner = match.Result.Winner
-			}
-			results = append(results, sr)
+		resp, err := client.SendRequest(runtime, &confidentialhttp.ConfidentialHTTPRequest{
+			Request: &confidentialhttp.HTTPRequest{
+				Url:    url,
+				Method: "GET",
+				MultiHeaders: map[string]*confidentialhttp.HeaderValues{
+					"X-Api-Key": {Values: []string{fmt.Sprintf("{{.%s}}", src.keyID)}},
+				},
+				EncryptOutput: false,
+			},
+			VaultDonSecrets: []*confidentialhttp.SecretIdentifier{
+				{Key: src.keyID},
+			},
+		}).Await()
+		if err != nil {
+			logger.Error("confidential HTTP request failed", "source", src.name, "err", err)
+			continue
+		}
+		if resp.StatusCode == 401 {
+			logger.Warn(fmt.Sprintf("[CHECK] Source %s rejected API key (401) — skipping", src.name))
+			continue
 		}
 
-		return &SourcesResponse{Sources: results}, nil
+		var match APIMatch
+		if err := json.Unmarshal(resp.Body, &match); err != nil {
+			logger.Error("failed to unmarshal source response", "source", src.name, "err", err)
+			continue
+		}
+
+		sr := SourceResult{Source: src.name, Confident: true}
+		if match.Result != nil {
+			sr.MatchStatus = match.Result.MatchStatus
+			sr.Winner = match.Result.Winner
+		}
+		results = append(results, sr)
 	}
+
+	return &SourcesResponse{Sources: results}, nil
 }
 
 // ── Consensus Logic ──────────────────────────────────────────────────────
